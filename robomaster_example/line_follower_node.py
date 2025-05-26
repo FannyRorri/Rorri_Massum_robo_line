@@ -8,6 +8,7 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+import math
 
 import sys
 
@@ -19,29 +20,22 @@ class ControllerNode(Node):
         self.odom_pose = None
         self.odom_velocity = None
 
-        # camera sensors
-        self.left_v = None
-        self.mid_v = None
-        self.right_v = None
-
         self.bridge = CvBridge()
 
+        # intensities for each camera
         self.intensity_left = None
         self.intensity_mid = None
         self.intensity_right = None
 
+        # bool values to see if the images for said camera have been received
         self.received_left = False
         self.received_mid = False
         self.received_right = False
 
-        # steering
-        self.prev_diff = 0.0
-        self.alpha = 0.7
-        self.smoothed_diff = 0.0
-
         self.vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
         self.odom_subscriber = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
 
+        # subscribers to the cameras
         self.left_v = self.create_subscription(Image, '/left_vision', self.left_callback, 10)
         self.mid_v = self.create_subscription(Image, '/middle_vision', self.middle_callback, 10)
         self.right_v = self.create_subscription(Image, '/right_vision', self.right_callback, 10)
@@ -83,13 +77,15 @@ class ControllerNode(Node):
 
         return pose2
 
+    # callback to process the left camera input
     def left_callback(self, msg):
         self.get_logger().info("Left image received")
-        image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        self.intensity_left = np.mean(gray)/255.0
-        self.received_left = True
+        image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')  # ros img to openCV
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)  # convert to grayscale
+        self.intensity_left = np.mean(gray)/255.0   # average pixel intensity
+        self.received_left = True   # set bool to true since the values have been received
 
+    # callback to process the middle camera input
     def middle_callback(self, msg):
         self.get_logger().info("Middle image received")
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -97,6 +93,7 @@ class ControllerNode(Node):
         self.intensity_mid = np.mean(gray) /255.0
         self.received_mid = True
 
+    # callback to process the right camera input
     def right_callback(self, msg):
         self.get_logger().info("Right image received")
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -106,26 +103,15 @@ class ControllerNode(Node):
 
 
     def update_callback(self):
+        # wait to receive all the three cmaera images
         if not (self.received_left and self.received_mid and self.received_right):
             self.get_logger().info("Waiting for all camera images...")
             return
-
-        if (
-                self.intensity_left is not None and
-                self.intensity_mid is not None and
-                self.intensity_right is not None
-        ):
+        # check if they are not null
+        if (self.intensity_left is not None and  self.intensity_mid is not None and self.intensity_right is not None):
             self.get_logger().info(
                 f"Intensities - Left: {self.intensity_left:.4f}, Mid: {self.intensity_mid:.4f}, Right: {self.intensity_right:.4f}"
             )
-
-            # for straight line paths
-            # threshold = 0.6
-            #
-            # if self.intensity_mid > threshold:
-            #     self.get_logger().info("Line finished: stopping")
-            #     self.stop()
-            #     return
 
             v = 0.2
             cmd_vel = Twist()
@@ -133,25 +119,40 @@ class ControllerNode(Node):
             cmd_vel.angular.z = 0.0
 
             left = self.intensity_left
+            mid = self.intensity_mid
             right = self.intensity_right
-            diff = right - left
-            sf = 2.5
+            diff = right - left  # difference in intensities between the side cameras
+            self.get_logger().info(f"Diff: {diff}")
+            sf = 8.4 # steer factor for turning
+            max_steer = 7.5
+            if self.intensity_mid > 0.6:
+                max_steer = 8.2
+
+            # sharp turn when the difference is too big between the 2 cameras
+            if diff > 0.05:
+                sf = sf * 1.5
+            else:
+                sf = sf
+
             angular_z = sf * diff
 
-            max_steer = 1.0
             angular_z = max(min(angular_z, max_steer), -max_steer)
 
-            base_v = 0.2
-            min_v = 0.04
-            max_diff = 0.5
-            t = min(abs(diff) / max_diff, 1.0)
-            v = base_v - (base_v - min_v) * t
+            # velocity
+            base_v = 0.008
+            max_v = 0.25
+            max_diff = 0.15  # max allowed difference
+            turn = min(abs(diff) / max_diff, 1.0) # normalize turn factor
+            straight = 1.0 - turn
+            v = base_v + (max_v - base_v) * straight 
 
+            # reduce speed if you have lost the line in a camera
             no_line_thresh = 0.6
-            if left > no_line_thresh or right > no_line_thresh:
+            if left > no_line_thresh and right > no_line_thresh:   # you don't see both lines
+                v = 0.05  # slow down considerably to make the turn
+            elif left > no_line_thresh or right > no_line_thresh:  # you don't see one line
                 v = min(v, 0.08)
 
-            # Final command
             cmd_vel = Twist()
             cmd_vel.linear.x = v
             cmd_vel.angular.z = angular_z
